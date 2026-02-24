@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from signal_generator import generate_signals
+from statistical_arbitrage.signal_generator import generate_signals
 
 
 TRANSACTION_COST = 1.0  # flat fee per trade in dollars
