@@ -2,7 +2,7 @@ import pandas as pd
 import yfinance as yf
 
 
-def download_data(tickers, start_date, end_date):
+def download_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
     """Download adjusted close prices for a list of tickers.
 
     Parameters
@@ -24,9 +24,14 @@ def download_data(tickers, start_date, end_date):
         raw = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
         if raw.empty:
             raise ValueError(f"No data returned for ticker '{ticker}'.")
-        frames[ticker] = raw["Close"]
+        close = raw["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.rename(ticker)
+        frames[ticker] = close
 
-    prices = pd.DataFrame(frames)
+    prices = pd.concat(frames, axis=1)
     prices.dropna(how="all", inplace=True)
     prices.dropna(axis=1, how="all", inplace=True)
+    
     return prices

@@ -1,10 +1,9 @@
 from itertools import combinations
-
 import pandas as pd
 from statsmodels.tsa.stattools import coint
 
 
-def find_cointegrated_pairs(prices, significance=0.05):
+def find_cointegrated_pairs(prices: pd.DataFrame, significance: float = 0.05) -> list:
     """Find cointegrated pairs in a price DataFrame using the Engle-Granger test.
 
     Parameters
