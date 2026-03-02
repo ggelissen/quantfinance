@@ -3,6 +3,77 @@ import pandas as pd
 from pykalman import KalmanFilter
 from scipy.stats import norm
 
+from cointegration import calculate_johansen_weights
+
+
+def generate_signals_basket(prices: pd.DataFrame, window: int = 60, entry_prob: float = 2.0,
+                            exit_prob: float = 0.0) -> pd.DataFrame:
+    """Generate signals for a basket of assets.
+
+    Parameters
+    ----------
+    prices : pd.DataFrame
+        DataFrame of adjusted close prices (columns = tickers).
+    window : int, optional
+        Rolling window (in days) for mean and standard deviation. Default 60.
+    entry_prob : float, optional
+        Entry z-score threshold. Default 2.0.
+    exit_prob : float, optional
+        Exit z-score threshold. Default 0.0.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: 'signal'.
+    """
+    weights = calculate_johansen_weights(prices)
+    weighted_prices = prices.multiply(weights)
+    spread = weighted_prices.sum(axis=1)
+
+    rolling_mean = spread.rolling(window=window).mean()
+    rolling_std = spread.rolling(window=window).std()
+    z_score = (spread - rolling_mean) / rolling_std
+
+    z_vals = z_score.to_numpy()
+    signals = np.full(len(prices), np.nan)
+
+    signals = np.where(z_vals < np.negative(entry_prob), 1, signals)
+    signals = np.where(z_vals > entry_prob, -1, signals)
+    signals = np.where(np.abs(z_vals) <= exit_prob, 0, signals)
+
+    signals_series = pd.Series(signals, index=prices.index).ffill().fillna(0)
+
+    result = pd.DataFrame({'spread': spread, 'zscore': z_score, 'signal': signals_series})
+
+    for col in prices.columns:
+        result['weight_' + col] = weights[col]
+
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def calculate_spread(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 20) -> pd.DataFrame:
     """Calculate the spread between two assets and its rolling statistics.
 
