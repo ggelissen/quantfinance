@@ -1,0 +1,190 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from signal_generator import generate_signals_linear, generate_signals_copula
+
+
+def run_backtest(prices: pd.DataFrame, ticker_a: str, ticker_b: str, initial_capital: float = 10_000.0, 
+                 window: int = 60, entry_threshold: float = 0.05, exit_threshold: float = 0.5,
+                 capital_fraction: float = 0.5, transaction_costs: float = 1.0,
+                 copula_generation: bool = True) -> dict:
+    """Simulate pair-trading execution and compute performance metrics.
+
+    For each row the engine checks the signal column:
+    - Signal  1 (long spread)  → long *ticker_a*, short *ticker_b*
+    - Signal -1 (short spread) → short *ticker_a*, long *ticker_b*
+    - Signal  0 (exit)        → close all open positions
+
+    A flat transaction cost of $[TRANSACTION_COST] is charged whenever a trade is executed.
+
+    Parameters
+    ----------
+    prices : pd.DataFrame
+        DataFrame of adjusted close prices (columns include *ticker_a* and
+        *ticker_b*).
+    ticker_a : str
+        Dependent asset ticker.
+    ticker_b : str
+        Independent asset ticker.
+    initial_capital : float, optional
+        Starting portfolio value in dollars. Default 10,000.
+    window : int, optional
+        Rolling window for spread statistics. Default 60.
+    entry_threshold : float, optional
+        Entry threshold. Default 0.05.
+    exit_threshold : float, optional
+        Exit threshold. Default 0.5.
+    capital_fraction : float, optional
+        Fraction of capital to allocate to each trade. Default 0.5.
+    transaction_costs : float, optional
+        Flat fee per trade in dollars. Default 1.0.
+    copula_generation : bool, optional
+        If True, use copula-based signal generation. If False, use linear regression signals. Default True.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'portfolio' : pd.DataFrame with 'portfolio_value' and 'signal' columns
+        - 'total_return' : float, percentage return over the period
+        - 'max_drawdown' : float, maximum drawdown as a negative percentage
+        - 'sharpe_ratio' : float, annualised Sharpe ratio (risk-free rate = 0)
+    """
+    if copula_generation:
+        signal_df = generate_signals_copula(prices, ticker_a, ticker_b,
+                                            window=window, entry_prob=entry_threshold, exit_prob=exit_threshold)
+    else:
+        signal_df = generate_signals_linear(prices, ticker_a, ticker_b,
+                                            window=window, entry_z=entry_threshold, exit_z=exit_threshold)
+
+    price_a = prices[ticker_a].reindex(signal_df.index)
+    price_b = prices[ticker_b].reindex(signal_df.index)
+
+    position = signal_df['signal']
+    trade_starts = (position != 0) & (position != position.shift(1).fillna(0))
+
+    allocated_capital = np.multiply(initial_capital, capital_fraction)
+    shares_at_entry = (allocated_capital / price_a).where(trade_starts)
+    fixed_shares = shares_at_entry.ffill().fillna(0.0)
+
+    hr_at_entry = signal_df['hedge_ratio'].where(trade_starts)
+    fixed_hr = hr_at_entry.ffill().fillna(0.0)
+
+    diff_a = price_a.diff().fillna(0.0)
+    diff_b = price_b.diff().fillna(0.0)
+
+    shifted_position = position.shift(1).fillna(0.0)
+    shares_a_held = np.multiply(shifted_position, fixed_shares)
+    shares_b_held = np.multiply(shares_a_held, fixed_hr)
+
+    pnl_a = np.multiply(shares_a_held, diff_a)
+    pnl_b = np.multiply(shares_b_held, diff_b)
+
+    pnl = np.subtract(pnl_a, pnl_b)
+
+    trades = position.diff().fillna(position).abs() > 0
+    trade_costs = np.multiply(trades.astype(float), transaction_costs)
+
+    net_daily = np.subtract(pnl.cumsum(), trade_costs.cumsum())
+    portfolio_value = np.add(initial_capital, net_daily)
+
+    portfolio = pd.DataFrame({'portfolio_value': portfolio_value, 'signal': position.values}, index=signal_df.index)
+
+    results = {
+        'portfolio': portfolio,
+        'total_return': _total_return(portfolio['portfolio_value'], initial_capital),
+        'max_drawdown': _max_drawdown(portfolio['portfolio_value']),
+        'sharpe_ratio': _sharpe_ratio(portfolio['portfolio_value'])
+    }
+    return results
+
+def run_backtest_kelly(prices: pd.DataFrame, ticker_a: str, ticker_b: str, initial_capital: float = 10_000.0, 
+                       window: int = 60, entry_threshold: float = 0.05, exit_threshold: float = 0.5, 
+                       capital_fraction: float = 0.5, transaction_costs: float = 1.0, copula_generation: bool = True) -> dict:
+    """Run backtest using Kelly fraction for position sizing."""
+    first_pass = run_backtest(prices, ticker_a, ticker_b, initial_capital=initial_capital, window=window,
+                              entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+                              capital_fraction=capital_fraction, transaction_costs=transaction_costs,
+                              copula_generation=copula_generation)
+    
+    portfolio_values = first_pass['portfolio']['portfolio_value']
+    daily_returns = portfolio_values.pct_change().dropna()
+    optimal_fraction = _kelly_fraction(daily_returns)
+
+    final_pass = run_backtest(prices, ticker_a, ticker_b, initial_capital=initial_capital, window=window,
+                              entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+                              capital_fraction=optimal_fraction, transaction_costs=transaction_costs,
+                              copula_generation=copula_generation)
+    return final_pass
+
+
+def _total_return(portfolio_values: pd.Series, initial_capital: float) -> float:
+    """Calculate total percentage return."""
+    final_value = portfolio_values.dropna().iloc[-1]
+    return (final_value - initial_capital) / initial_capital * 100.0
+
+
+def _max_drawdown(portfolio_values: pd.Series) -> float:
+    """Calculate maximum drawdown as a percentage (negative number)."""
+    values = portfolio_values.dropna()
+    cummax = values.cummax()
+    drawdown = (values - cummax) / cummax * 100.0
+    return drawdown.min()
+
+
+def _sharpe_ratio(portfolio_values: pd.Series, trading_days: int = 252) -> float:
+    """Annualized Sharpe ratio assuming a risk-free rate of zero."""
+    values = portfolio_values.dropna()
+    daily_returns = values.pct_change().dropna()
+    if daily_returns.std() == 0:
+        return 0.0
+    return (daily_returns.mean() / daily_returns.std()) * np.sqrt(trading_days)
+
+def _kelly_fraction(portfolio_returns: pd.Series) -> float:
+    """Calculate the Kelly fraction based on historical returns."""
+    returns = portfolio_returns.dropna()
+    mean_return = returns.mean()
+    std_return = returns.std()
+    if std_return == 0:
+        return 0.0
+    kelly_fraction = mean_return / (std_return ** 2)
+    return float(np.clip(kelly_fraction, 0.0, 1.0))
+
+
+def plot_results(results: dict, ticker_a: str, ticker_b: str) -> None:
+    """Plot the portfolio equity curve and trade entry points.
+
+    Parameters
+    ----------
+    results : dict
+        Output dictionary from :func:`run_backtest`.
+    ticker_a : str
+        Label for the dependent asset.
+    ticker_b : str
+        Label for the independent asset.
+    """
+    portfolio = results["portfolio"]
+    equity = portfolio["portfolio_value"]
+    signals = portfolio["signal"]
+
+    signal_shifted = signals.shift(1).fillna(0)
+    trade_starts = signals != signal_shifted
+
+    long_entries = portfolio[trade_starts & signals == 1].index
+    short_entries = portfolio[trade_starts & signals == -1].index
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(equity.index, equity.values, label="Portfolio Value", linewidth=1.5)
+
+    ax.scatter(long_entries, equity.loc[long_entries], marker="^", color="green",
+               label="Long Entry", zorder=5)
+    ax.scatter(short_entries, equity.loc[short_entries], marker="v", color="red",
+               label="Short Entry", zorder=5)
+
+    ax.set_title(f"Equity Curve — {ticker_a} / {ticker_b}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Portfolio Value ($)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
