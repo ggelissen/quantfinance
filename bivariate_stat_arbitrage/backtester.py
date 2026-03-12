@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 
 from signal_generator import generate_signals_linear, generate_signals_copula
+from performance_metrics import calculate_metrics
+from dashboard import create_dashboard
 
 
 def run_backtest(prices: pd.DataFrame, ticker_a: str, ticker_b: str, initial_capital: float = 10_000.0, 
@@ -71,17 +73,17 @@ def run_backtest(prices: pd.DataFrame, ticker_a: str, ticker_b: str, initial_cap
     hr_at_entry = signal_df['hedge_ratio'].where(trade_starts)
     fixed_hr = hr_at_entry.ffill().fillna(0.0)
 
+    shifted_position = position.shift(1).fillna(0.0)
+    
+    # Calculate raw PnL from holding the spread (long A, short B)
+    # This represents the PnL if we were LONG the spread with fixed_shares
     diff_a = price_a.diff().fillna(0.0)
     diff_b = price_b.diff().fillna(0.0)
-
-    shifted_position = position.shift(1).fillna(0.0)
-    shares_a_held = np.multiply(shifted_position, fixed_shares)
-    shares_b_held = np.multiply(shares_a_held, fixed_hr)
-
-    pnl_a = np.multiply(shares_a_held, diff_a)
-    pnl_b = np.multiply(shares_b_held, diff_b)
-
-    pnl = np.subtract(pnl_a, pnl_b)
+    
+    spread_pnl_per_share = diff_a - np.multiply(fixed_hr, diff_b)
+    
+    # Position sign determines direction: +1 = long spread, -1 = short spread
+    pnl = np.multiply(np.multiply(shifted_position, fixed_shares), spread_pnl_per_share)
 
     trades = position.diff().fillna(position).abs() > 0
     trade_costs = np.multiply(trades.astype(float), transaction_costs)
@@ -91,11 +93,15 @@ def run_backtest(prices: pd.DataFrame, ticker_a: str, ticker_b: str, initial_cap
 
     portfolio = pd.DataFrame({'portfolio_value': portfolio_value, 'signal': position.values}, index=signal_df.index)
 
+    # Calculate comprehensive metrics
+    metrics = calculate_metrics(portfolio['portfolio_value'], portfolio['signal'], initial_capital)
+    
     results = {
         'portfolio': portfolio,
-        'total_return': _total_return(portfolio['portfolio_value'], initial_capital),
-        'max_drawdown': _max_drawdown(portfolio['portfolio_value']),
-        'sharpe_ratio': _sharpe_ratio(portfolio['portfolio_value'])
+        'total_return': metrics['total_return'],
+        'max_drawdown': metrics['max_drawdown'],
+        'sharpe_ratio': metrics['sharpe_ratio'],
+        'metrics': metrics  # Include all metrics for dashboard
     }
     return results
 
@@ -152,39 +158,56 @@ def _kelly_fraction(portfolio_returns: pd.Series) -> float:
     return float(np.clip(kelly_fraction, 0.0, 1.0))
 
 
-def plot_results(results: dict, ticker_a: str, ticker_b: str) -> None:
-    """Plot the portfolio equity curve and trade entry points.
+def plot_results(results: dict, ticker_a: str, ticker_b: str, use_dashboard: bool = True, 
+                 initial_capital: float = 10000, prices: pd.DataFrame = None) -> None:
+    """Plot strategy performance.
 
     Parameters
     ----------
     results : dict
-        Output dictionary from :func:`run_backtest`.
+        Results dictionary from run_backtest
     ticker_a : str
         Label for the dependent asset.
     ticker_b : str
         Label for the independent asset.
+    use_dashboard : bool, optional
+        If True, use comprehensive dashboard. If False, use simple equity plot. Default True.
+    initial_capital : float, optional
+        Initial capital for metrics calculation. Default 10000.
+    prices : pd.DataFrame, optional
+        Price DataFrame for copula analysis. If provided, will be used in dashboard.
     """
-    portfolio = results["portfolio"]
-    equity = portfolio["portfolio_value"]
-    signals = portfolio["signal"]
+    if use_dashboard:
+        prices_a = prices[ticker_a] if prices is not None else None
+        prices_b = prices[ticker_b] if prices is not None else None
+        create_dashboard(results, ticker_a, ticker_b, initial_capital, prices_a, prices_b)
+    else:
+        # Simple equity curve plot
+        portfolio = results["portfolio"]
+        equity = portfolio["portfolio_value"]
+        signals = portfolio["signal"]
 
-    signal_shifted = signals.shift(1).fillna(0)
-    trade_starts = signals != signal_shifted
+        signal_shifted = signals.shift(1).fillna(0)
+        trade_starts = signals != signal_shifted
 
-    long_entries = portfolio[trade_starts & signals == 1].index
-    short_entries = portfolio[trade_starts & signals == -1].index
+        long_entries = portfolio[trade_starts & (signals == 1)].index
+        short_entries = portfolio[trade_starts & (signals == -1)].index
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(equity.index, equity.values, label="Portfolio Value", linewidth=1.5)
+        print(f"  → Plotting {len(long_entries)} long entries and {len(short_entries)} short entries")
 
-    ax.scatter(long_entries, equity.loc[long_entries], marker="^", color="green",
-               label="Long Entry", zorder=5)
-    ax.scatter(short_entries, equity.loc[short_entries], marker="v", color="red",
-               label="Short Entry", zorder=5)
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(equity.index, equity.values, label="Portfolio Value", linewidth=1.5, alpha=0.7)
 
-    ax.set_title(f"Equity Curve — {ticker_a} / {ticker_b}")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Portfolio Value ($)")
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
+        if len(long_entries) > 0:
+            ax.scatter(long_entries, equity.loc[long_entries], marker="^", color="green",
+                       label=f"Long Entry ({len(long_entries)})", s=100, zorder=10, edgecolors='darkgreen', linewidths=1.5)
+        if len(short_entries) > 0:
+            ax.scatter(short_entries, equity.loc[short_entries], marker="v", color="red",
+                       label=f"Short Entry ({len(short_entries)})", s=100, zorder=10, edgecolors='darkred', linewidths=1.5)
+
+        ax.set_title(f"Equity Curve — {ticker_a} / {ticker_b}")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Portfolio Value ($)")
+        ax.legend()
+        plt.tight_layout()
+        plt.show()

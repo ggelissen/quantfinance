@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from pykalman import KalmanFilter
-from scipy.stats import norm
+from scipy.stats import norm, t
 
 def calculate_spread(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 20) -> pd.DataFrame:
     """Calculate the spread between two assets and its rolling statistics.
@@ -57,7 +57,7 @@ def calculate_spread(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window:
 
     result = pd.DataFrame({
         "spread": spread,
-        "rolling_mean": 0.0,
+        "rolling_mean": 0.0,  # Zero-centered by Kalman filter intercept term
         "rolling_std": spread.rolling(window=window).std(),
         "hedge_ratio": hedge_ratio,
     })
@@ -138,8 +138,8 @@ def generate_signals_linear(prices: pd.DataFrame, ticker_a: str, ticker_b: str, 
 
 
 def generate_signals_copula(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 60, 
-                            entry_prob: float = 0.05, exit_prob: float = 0.5) -> pd.DataFrame:
-    """Generate long, short, and exit trading signals based on z-score thresholds.
+                            entry_prob: float = 0.05, exit_prob: float = 0.5, df: int = 4) -> pd.DataFrame:
+    """Generate long, short, and exit trading signals based on copula-based conditional probabilities.
 
     Parameters
     ----------
@@ -155,6 +155,8 @@ def generate_signals_copula(prices: pd.DataFrame, ticker_a: str, ticker_b: str, 
         Probability threshold that triggers entry. Default 0.05.
     exit_prob : float, optional
         Probability level at which positions are closed. Default 0.5.
+    df : int, optional
+        Degrees of freedom for the t-distribution. Default 4.
 
     Returns
     -------
@@ -177,14 +179,26 @@ def generate_signals_copula(prices: pd.DataFrame, ticker_a: str, ticker_b: str, 
 
     rho = ret_a.rolling(window=window).corr(ret_b)
 
-    x = norm.ppf(u)
-    y = norm.ppf(v)
+    x = t.ppf(u, df=df)
+    y = t.ppf(v, df=df)
 
-    cond_prob_series = norm.cdf((x - rho * y) / np.sqrt(1 - rho**2))
+    numerator = x - rho * y
+    denominator = np.sqrt(((df + y**2) * (1 - rho**2)) / (df + 1))
 
+    cond_prob_series = t.cdf(numerator / denominator, df=df + 1)
+
+    # Generate signals based on conditional probability
+    # Use a small tolerance around exit_prob to define neutral zone
+    exit_tolerance = 0.05
     signals = np.full(len(common_index), np.nan)
-    signals = np.where(cond_prob_series < entry_prob, 1, signals)
-    signals = np.where(cond_prob_series > (1 - entry_prob), -1, signals)
+    
+    # Entry signals at probability extremes
+    signals = np.where(cond_prob_series < entry_prob, 1, signals)  # Long entry
+    signals = np.where(cond_prob_series > (1 - entry_prob), -1, signals)  # Short entry
+    
+    # Exit signals when probability returns near the exit threshold
+    in_exit_zone = np.abs(cond_prob_series - exit_prob) <= exit_tolerance
+    signals = np.where(in_exit_zone, 0, signals)
 
     signals_series = pd.Series(signals, index=common_index).ffill().fillna(0)
 
