@@ -34,6 +34,7 @@ from visualization import (
     plot_equity_and_signals,
     plot_rolling_volatility,
 )
+from video_generator import generate_video as make_video
 
 
 def main(
@@ -44,7 +45,7 @@ def main(
     # Signal parameters
     window: int = 60,
     lag: int = 1,
-    sub_window: int = 21,
+    sub_window: int = None,
     k_windows: int = 10,
     quantile: float = 0.25,
     # Position parameters
@@ -61,6 +62,11 @@ def main(
     # Display
     show_plots: bool = True,
     save_html: bool = False,
+    # Video
+    generate_video: bool = False,
+    video_output_path: str = "volatility_strategy.mp4",
+    video_frame_step: int = 5,
+    video_show: bool = True,
 ) -> dict:
     """Run the full volatility-adjusted S&P 500 strategy pipeline.
 
@@ -78,10 +84,11 @@ def main(
         Auto-covariance rolling window W. Default 60.
     lag : int, optional
         Auto-covariance lag l. Default 1.
-    sub_window : int, optional
-        Realised-variance sub-window w. Default 21.
+    sub_window : int or None, optional
+        Realised-variance sub-window.  If ``None`` (default), the improved
+        formula uses ``window`` (W) for both terms.
     k_windows : int, optional
-        Number of sub-windows K. Default 10.
+        Number K for the volatility floor. Default 10.
     quantile : float, optional
         Volatility-floor quantile level q. Default 0.25.
     rolling_window : int, optional
@@ -104,6 +111,15 @@ def main(
         Call ``fig.show()`` for each figure. Default True.
     save_html : bool, optional
         Save each figure as a standalone HTML file. Default False.
+    generate_video : bool, optional
+        Render and save the cyberpunk strategy video. Default False.
+    video_output_path : str, optional
+        File path for the output MP4. Default 'volatility_strategy.mp4'.
+    video_frame_step : int, optional
+        Advance this many trading days per video frame. Default 5.
+    video_show : bool, optional
+        Attempt to open the video with the system player after rendering.
+        Default True.
 
     Returns
     -------
@@ -203,6 +219,20 @@ def main(
         fig_equity.show()
         fig_vol.show()
 
+    # ------------------------------------------------------------------
+    # 6. Optional: cyberpunk video
+    # ------------------------------------------------------------------
+    if generate_video:
+        print("Generating strategy video …")
+        make_video(
+            surface_df=surface_df,
+            portfolio=portfolio,
+            data=data,
+            output_path=video_output_path,
+            frame_step=video_frame_step,
+            show_video=video_show,
+        )
+
     elapsed = time.perf_counter() - t0
     print(f"\nTotal runtime: {elapsed:.2f} seconds")
     return results
@@ -217,7 +247,6 @@ if __name__ == "__main__":
         # Signal
         window=60,
         lag=1,
-        sub_window=21,
         k_windows=10,
         quantile=0.25,
         # Positions
@@ -234,4 +263,9 @@ if __name__ == "__main__":
         # Output
         show_plots=True,
         save_html=False,
+        # Video
+        generate_video=False,
+        video_output_path="volatility_strategy.mp4",
+        video_frame_step=5,
+        video_show=True,
     )
