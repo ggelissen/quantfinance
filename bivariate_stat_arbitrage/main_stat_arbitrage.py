@@ -61,12 +61,6 @@ def main(prices: pd.DataFrame, pairs: list, initial_capital: float, capital_frac
 
 if __name__ == "__main__":
     start_time = time.perf_counter()
-    #tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA",
-     #          "KO", "PEP", "INTC", "CSCO", "ADBE",
-      #         "GS", "BAC", "WFC", "C", "JPM",
-       #        "XOM", "CVX",
-        #       "FDX", "UPS",
-         #      "QQQ", "SPY"] 
     tickers = ["AMZN", "ADBE"]  # For faster testing
     start_date = "2024-01-01"
     end_date = "2026-01-01"

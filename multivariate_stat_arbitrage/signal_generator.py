@@ -1,265 +1,163 @@
+import importlib
+
 import numpy as np
 import pandas as pd
-from pykalman import KalmanFilter
 from scipy.stats import norm
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
-from cointegration import calculate_johansen_weights
+try:
+    pv = importlib.import_module("pyvinecopulib")
+except Exception:
+    pv = None
 
 
-def generate_signals_basket(prices: pd.DataFrame, window: int = 60, entry_prob: float = 2.0,
-                            exit_prob: float = 0.0) -> pd.DataFrame:
-    """Generate signals for a basket of assets.
+def calculate_johansen_weights(prices_df: pd.DataFrame, det_order: int = 0, k_ar_diff: int = 1) -> pd.Series:
+    """Return normalized Johansen eigenvector weights for a basket."""
+    clean_prices = prices_df.dropna(how="any")
+    if clean_prices.shape[1] < 3:
+        raise ValueError("Johansen basket model requires at least 3 tickers.")
+    if len(clean_prices) < 30:
+        raise ValueError("Not enough observations for Johansen test.")
 
-    Parameters
-    ----------
-    prices : pd.DataFrame
-        DataFrame of adjusted close prices (columns = tickers).
-    window : int, optional
-        Rolling window (in days) for mean and standard deviation. Default 60.
-    entry_prob : float, optional
-        Entry z-score threshold. Default 2.0.
-    exit_prob : float, optional
-        Exit z-score threshold. Default 0.0.
+    result = coint_johansen(clean_prices.to_numpy(), det_order, k_ar_diff)
+    best_eigenvector = result.evec[:, 0]
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: 'signal'.
-    """
-    weights = calculate_johansen_weights(prices)
-    weighted_prices = prices.multiply(weights)
-    spread = weighted_prices.sum(axis=1)
+    if np.isclose(best_eigenvector[0], 0.0):
+        non_zero_idx = int(np.argmax(np.abs(best_eigenvector)))
+        denom = best_eigenvector[non_zero_idx]
+    else:
+        denom = best_eigenvector[0]
 
+    weights = best_eigenvector / denom
+    return pd.Series(weights, index=clean_prices.columns)
+
+
+def _basket_spread_components(prices_df: pd.DataFrame, window: int, det_order: int, k_ar_diff: int):
+    clean_prices = prices_df.dropna(how="any")
+    weights = calculate_johansen_weights(clean_prices, det_order=det_order, k_ar_diff=k_ar_diff)
+    spread = clean_prices.mul(weights, axis=1).sum(axis=1)
     rolling_mean = spread.rolling(window=window).mean()
-    rolling_std = spread.rolling(window=window).std()
-    z_score = (spread - rolling_mean) / rolling_std
-
-    z_vals = z_score.to_numpy()
-    signals = np.full(len(prices), np.nan)
-
-    signals = np.where(z_vals < np.negative(entry_prob), 1, signals)
-    signals = np.where(z_vals > entry_prob, -1, signals)
-    signals = np.where(np.abs(z_vals) <= exit_prob, 0, signals)
-
-    signals_series = pd.Series(signals, index=prices.index).ffill().fillna(0)
-
-    result = pd.DataFrame({'spread': spread, 'zscore': z_score, 'signal': signals_series})
-
-    for col in prices.columns:
-        result['weight_' + col] = weights[col]
-
-    return result
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def calculate_spread(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 20) -> pd.DataFrame:
-    """Calculate the spread between two assets and its rolling statistics.
-
-    An OLS regression is run to find the hedge ratio between *ticker_a*
-    (dependent) and *ticker_b* (independent).  The spread is defined as::
-
-        spread = price_a - hedge_ratio * price_b
-
-    Parameters
-    ----------
-    prices : pd.DataFrame
-        DataFrame of adjusted close prices (columns = tickers).
-    ticker_a : str
-        Dependent asset ticker.
-    ticker_b : str
-        Independent asset ticker.
-    window : int, optional
-        Rolling window (in days) for mean and standard deviation. Default 20.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: 'spread', 'rolling_mean', 'rolling_std',
-        'hedge_ratio'.
-    """
-    series_a = prices[ticker_a].dropna()
-    series_b = prices[ticker_b].dropna()
-    common_index = series_a.index.intersection(series_b.index)
-    series_a = series_a.loc[common_index]
-    series_b = series_b.loc[common_index]
-
-    obs_mat = np.vstack([series_b, np.ones(series_b.shape)]).T[:, np.newaxis, :]
-
-    kf = KalmanFilter(
-        n_dim_obs=1,
-        n_dim_state=2,
-        initial_state_mean=np.zeros(2),
-        initial_state_covariance=np.ones((2, 2)),
-        transition_matrices=np.eye(2),
-        observation_matrices=obs_mat,
-        observation_covariance=1.0,
-        transition_covariance=np.eye(2) * 1e-4
-    )
-
-    state_means = kf.filter(series_a.values)[0]
-
-    hedge_ratio = pd.Series(state_means[:, 0], index=common_index).shift(1)
-    intercept = pd.Series(state_means[:, 1], index=common_index).shift(1)
-
-    adjusted_b = np.add(np.multiply(hedge_ratio, series_b), intercept)
-    spread = np.subtract(series_a, adjusted_b)
-
-    result = pd.DataFrame({
-        "spread": spread,
-        "rolling_mean": 0.0,
-        "rolling_std": spread.rolling(window=window).std(),
-        "hedge_ratio": hedge_ratio,
-    })
-
-    return result
-
-
-def compute_zscore(spread_df: pd.DataFrame) -> pd.Series:
-    """Compute the z-score of the spread.
-
-    Parameters
-    ----------
-    spread_df : pd.DataFrame
-        Output from :func:`calculate_spread`.
-
-    Returns
-    -------
-    pd.Series
-        Z-score series aligned with *spread_df*.
-    """
-    spread = spread_df["spread"].to_numpy()
-
-    rolling_mean = spread_df["rolling_mean"].to_numpy()
-    rolling_std = spread_df["rolling_std"].to_numpy()
-
+    rolling_std = spread.rolling(window=window).std().replace(0.0, np.nan)
     zscore = (spread - rolling_mean) / rolling_std
+    returns = clean_prices.pct_change()
+    return clean_prices, weights, spread, zscore, returns
 
-    return pd.Series(zscore, index=spread_df.index, name="zscore")
+
+def _pseudo_observations(returns_window: pd.DataFrame) -> np.ndarray:
+    ranked = returns_window.rank(axis=0, pct=True)
+    eps = 1e-4
+    return np.clip(ranked.to_numpy(), eps, 1.0 - eps)
 
 
-def generate_signals_linear(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 20, 
-                            entry_z: float = 2.0, exit_z: float = 0.0) -> pd.DataFrame:
-    """Generate long, short, and exit trading signals based on z-score thresholds.
+def _approx_joint_prob_gaussian(u_window: np.ndarray, random_state: int = 42) -> float:
+    d = u_window.shape[1]
+    if d < 2:
+        return 0.5
 
-    Signals
-    -------
-    - **1**  (long)  : z-score < -entry_z  → buy spread (long *ticker_a*, short *ticker_b*)
-    - **-1** (short) : z-score >  entry_z  → sell spread (short *ticker_a*, long *ticker_b*)
-    - **0**  (exit)  : z-score crosses *exit_z* (passes through zero)
+    z_window = norm.ppf(u_window)
+    z_hist = z_window[:-1, :]
+    z_last = z_window[-1, :]
+    if z_hist.shape[0] < 10:
+        return 0.5
 
-    Parameters
-    ----------
-    prices : pd.DataFrame
-        DataFrame of adjusted close prices (columns = tickers).
-    ticker_a : str
-        Dependent asset ticker.
-    ticker_b : str
-        Independent asset ticker.
-    window : int, optional
-        Rolling window for spread statistics. Default 20.
-    entry_z : float, optional
-        Z-score threshold that triggers entry. Default 2.0.
-    exit_z : float, optional
-        Z-score level at which positions are closed. Default 0.0.
+    cov = np.corrcoef(z_hist, rowvar=False)
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+    cov = (cov + cov.T) / 2.0
+    cov += np.eye(d) * 1e-6
 
-    Returns
-    -------
-    pd.DataFrame
-        Original spread DataFrame with additional columns: 'zscore' and
-        'signal' (1 = long, -1 = short, 0 = exit / no position).
-    """
-    spread_df = calculate_spread(prices, ticker_a, ticker_b, window=window)
+    rng = np.random.default_rng(random_state)
+    sims = rng.multivariate_normal(mean=np.zeros(d), cov=cov, size=2000)
+    joint_prob = np.mean(np.all(sims <= z_last, axis=1))
+    return float(np.clip(joint_prob, 0.0, 1.0))
 
-    zscore = compute_zscore(spread_df)
-    z_vals = zscore.to_numpy()
 
-    signals = np.select([z_vals < np.negative(entry_z), z_vals > entry_z, np.abs(z_vals) <= exit_z],
-                        [1, -1, 0],
-                        default=np.nan,
+def _joint_probability_vine(returns_window: pd.DataFrame, random_state: int = 42) -> float:
+    u_window = _pseudo_observations(returns_window)
+    if u_window.shape[0] < 15:
+        return 0.5
+
+    if pv is not None:
+        try:
+            train_u = u_window[:-1, :]
+            last_u = u_window[-1:, :]
+            model = pv.Vinecop.from_data(train_u)
+            vine_cdf = model.cdf(last_u)
+            return float(np.clip(vine_cdf[0], 0.0, 1.0))
+        except Exception:
+            pass
+
+    return _approx_joint_prob_gaussian(u_window, random_state=random_state)
+
+
+def generate_signals_basket(prices_df: pd.DataFrame, window: int = 60, entry_z: float = 2.0,
+                            exit_z: float = 0.5, det_order: int = 0, k_ar_diff: int = 1) -> pd.DataFrame:
+    """Generate multivariate basket signals from Johansen spread z-score."""
+    clean_prices, weights, spread, zscore, _ = _basket_spread_components(
+        prices_df, window=window, det_order=det_order, k_ar_diff=k_ar_diff
     )
 
-    spread_df["zscore"] = zscore
-    raw_signals = pd.Series(signals, index=spread_df.index)
-    spread_df["signal"] = raw_signals.ffill().fillna(0)
+    z_vals = zscore.to_numpy()
+    signals = np.full(len(clean_prices), np.nan)
+    signals = np.where(z_vals < -entry_z, 1, signals)
+    signals = np.where(z_vals > entry_z, -1, signals)
+    signals = np.where(np.abs(z_vals) <= exit_z, 0, signals)
 
-    return spread_df
+    signals_series = pd.Series(signals, index=clean_prices.index).ffill().fillna(0)
+    result = pd.DataFrame({"spread": spread, "zscore": zscore, "signal": signals_series})
+
+    for ticker in clean_prices.columns:
+        result[f"weight_{ticker}"] = float(weights[ticker])
+
+    return result
 
 
+def generate_signals_basket_vine_copula(
+    prices_df: pd.DataFrame,
+    window: int = 60,
+    entry_prob: float = 0.05,
+    exit_prob: float = 0.5,
+    exit_z: float = 0.5,
+    exit_tolerance: float = 0.05,
+    det_order: int = 0,
+    k_ar_diff: int = 1,
+) -> pd.DataFrame:
+    """Generate basket signals using a rolling vine copula + spread filter."""
+    clean_prices, weights, spread, zscore, returns = _basket_spread_components(
+        prices_df, window=window, det_order=det_order, k_ar_diff=k_ar_diff
+    )
 
-def generate_signals_copula(prices: pd.DataFrame, ticker_a: str, ticker_b: str, window: int = 60, 
-                            entry_prob: float = 0.05, exit_prob: float = 0.5) -> pd.DataFrame:
-    """Generate long, short, and exit trading signals based on z-score thresholds.
+    joint_prob = pd.Series(np.nan, index=clean_prices.index, dtype=float)
+    min_obs = max(30, clean_prices.shape[1] * 8)
 
-    Parameters
-    ----------
-    prices : pd.DataFrame
-        DataFrame of adjusted close prices (columns = tickers).
-    ticker_a : str
-        Dependent asset ticker.
-    ticker_b : str
-        Independent asset ticker.
-    window : int, optional
-        Rolling window for spread statistics. Default 60.
-    entry_prob : float, optional
-        Probability threshold that triggers entry. Default 0.05.
-    exit_prob : float, optional
-        Probability level at which positions are closed. Default 0.5.
+    for i in range(window, len(clean_prices)):
+        rolling_returns = returns.iloc[i - window + 1: i + 1].dropna(how="any")
+        if len(rolling_returns) < min_obs:
+            continue
+        joint_prob.iloc[i] = _joint_probability_vine(rolling_returns, random_state=42 + i)
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns 'signal' (1 = long, -1 = short, 0 = exit) and
-        'hedge_ratio' for the spread.
+    z_vals = zscore.to_numpy()
+    p_vals = joint_prob.to_numpy()
+    signals = np.full(len(clean_prices), np.nan)
 
-    """
-    returns_a = prices[ticker_a].pct_change().dropna()
-    returns_b = prices[ticker_b].pct_change().dropna()
-    common_index = returns_a.index.intersection(returns_b.index)
-    ret_a = returns_a.loc[common_index]
-    ret_b = returns_b.loc[common_index]
+    long_entries = (p_vals < entry_prob) & (z_vals < 0)
+    short_entries = (p_vals > (1.0 - entry_prob)) & (z_vals > 0)
+    exits = (np.abs(z_vals) <= exit_z) | (np.abs(p_vals - exit_prob) <= exit_tolerance)
 
-    u = ret_a.rolling(window=window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
-    v = ret_b.rolling(window=window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
+    signals = np.where(long_entries, 1, signals)
+    signals = np.where(short_entries, -1, signals)
+    signals = np.where(exits, 0, signals)
 
-    u = np.clip(u, 0.001, 0.999)
-    v = np.clip(v, 0.001, 0.999)
+    signals_series = pd.Series(signals, index=clean_prices.index).ffill().fillna(0)
+    result = pd.DataFrame(
+        {
+            "spread": spread,
+            "zscore": zscore,
+            "joint_probability": joint_prob,
+            "signal": signals_series,
+        }
+    )
 
-    rho = ret_a.rolling(window=window).corr(ret_b)
-
-    x = norm.ppf(u)
-    y = norm.ppf(v)
-
-    cond_prob_series = norm.cdf((x - rho * y) / np.sqrt(1 - rho**2))
-
-    signals = np.full(len(common_index), np.nan)
-    signals = np.where(cond_prob_series < entry_prob, 1, signals)
-    signals = np.where(cond_prob_series > (1 - entry_prob), -1, signals)
-
-    signals_series = pd.Series(signals, index=common_index).ffill().fillna(0)
-
-    hr = np.divide(prices[ticker_a].loc[common_index], prices[ticker_b].loc[common_index])
-    result = pd.DataFrame({'signal': signals_series, 'hedge_ratio': hr}, index=common_index)
+    for ticker in clean_prices.columns:
+        result[f"weight_{ticker}"] = float(weights[ticker])
 
     return result

@@ -6,19 +6,19 @@ from skopt.space import Real, Integer
 from backtester import run_backtest
 
 
-def optimize_params(prices: pd.DataFrame, ticker_a: str, ticker_b: str, windows: list = [10, 20, 30], 
-                    entry_thresholds: list = [1.0, 1.5, 2.0], exit_thresholds: list = [0.5, 1.0, 1.5],
-                    copula_generation: bool = True) -> dict:
-    """Run backtests for different parameter combinations and find the best one.
+def optimize_params(prices: pd.DataFrame, basket_tickers: list[str], windows: list = [30, 60, 90],
+                    entry_thresholds: list = [0.02, 0.05, 0.08], exit_thresholds: list = [0.3, 0.5, 0.7],
+                    copula_generation: bool = True, vol_targeting: bool = False,
+                    target_annual_vol: float = 0.15, vol_lookback: int = 20,
+                    min_exposure_mult: float = 0.25, max_exposure_mult: float = 2.0) -> dict:
+    """Run basket backtests for different parameter combinations and find the best one.
 
     Parameters
     ----------
     prices : pd.DataFrame
         DataFrame of adjusted close prices (columns = tickers).
-    ticker_a : str
-        First ticker symbol.
-    ticker_b : str
-        Second ticker symbol.
+    basket_tickers : list[str]
+        Tickers included in the basket.
     windows : list of int, optional
         List of rolling window sizes to test. Default is [10, 20, 30].
     entry_thresholds : list of float, optional
@@ -40,8 +40,11 @@ def optimize_params(prices: pd.DataFrame, ticker_a: str, ticker_b: str, windows:
     for window in windows:
         for entry in entry_thresholds:
             for exit in exit_thresholds:
-                results = run_backtest(prices, ticker_a, ticker_b, copula_generation=copula_generation,
-                                       window=window, entry_threshold=entry, exit_threshold=exit)
+                results = run_backtest(prices, basket_tickers, copula_generation=copula_generation,
+                                       window=window, entry_threshold=entry, exit_threshold=exit,
+                                       vol_targeting=vol_targeting, target_annual_vol=target_annual_vol,
+                                       vol_lookback=vol_lookback, min_exposure_mult=min_exposure_mult,
+                                       max_exposure_mult=max_exposure_mult)
                 if results["sharpe_ratio"] > best_sharpe:
                     best_sharpe = results["sharpe_ratio"]
                     best_params["window"] = window
@@ -52,8 +55,10 @@ def optimize_params(prices: pd.DataFrame, ticker_a: str, ticker_b: str, windows:
 
 
 
-def optimize_params_bayes(prices: pd.DataFrame, ticker_a: str, ticker_b: str,
-                          copula_generation: bool = True) -> dict:
+def optimize_params_bayes(prices: pd.DataFrame, basket_tickers: list[str],
+                          copula_generation: bool = True, vol_targeting: bool = False,
+                          target_annual_vol: float = 0.15, vol_lookback: int = 20,
+                          min_exposure_mult: float = 0.25, max_exposure_mult: float = 2.0) -> dict:
     """Bayesian optimization of backtest parameters.
 
     This function implements a sophisticated optimization approach 
@@ -63,10 +68,8 @@ def optimize_params_bayes(prices: pd.DataFrame, ticker_a: str, ticker_b: str,
     ----------
     prices : pd.DataFrame
         DataFrame of adjusted close prices (columns = tickers).
-    ticker_a : str
-        First ticker symbol.
-    ticker_b : str
-        Second ticker symbol.
+    basket_tickers : list[str]
+        Tickers included in the basket.
     copula_generation : bool, optional  
         If True, use copula-based signal generation. If False, use linear regression signals. Default True.
     Returns
@@ -76,7 +79,8 @@ def optimize_params_bayes(prices: pd.DataFrame, ticker_a: str, ticker_b: str,
         'exit_threshold' for the best parameters.
     """
 
-    max_window = int(len(prices) / 4)
+    basket_prices = prices[basket_tickers].dropna(how="any")
+    max_window = int(len(basket_prices) / 4)
     if copula_generation:
         coarse_space = [Integer(20, max_window, name='window'),
                         Real(0.01, 0.1, name='entry_threshold'),
@@ -90,9 +94,11 @@ def optimize_params_bayes(prices: pd.DataFrame, ticker_a: str, ticker_b: str,
 
     def objective(params):
         window, entry_threshold, exit_threshold = params
-        results = run_backtest(prices, ticker_a, ticker_b, copula_generation=copula_generation,
+        results = run_backtest(prices, basket_tickers, copula_generation=copula_generation,
                                window=window, entry_threshold=entry_threshold, 
-                               exit_threshold=exit_threshold)
+                               exit_threshold=exit_threshold, vol_targeting=vol_targeting,
+                               target_annual_vol=target_annual_vol, vol_lookback=vol_lookback,
+                               min_exposure_mult=min_exposure_mult, max_exposure_mult=max_exposure_mult)
         sharpe = results["sharpe_ratio"]
         
         if np.isnan(sharpe):
