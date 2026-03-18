@@ -1,6 +1,6 @@
 # Volatility-Adjusted S&P 500 Strategy
 
-A Python project that implements and visualises a volatility-regime-based trading strategy on the S&P 500 using a **100 % free & open-source** stack.
+A Python project that implements and visualises a volatility-regime-based trading strategy on the S&P 500.
 
 ---
 
@@ -10,7 +10,9 @@ A Python project that implements and visualises a volatility-regime-based tradin
 
 The composite signal is defined as:
 
-$$S(t,l) = \underbrace{\frac{1}{W}\sum_{i=0}^{W-1}(r_{t-i}-\bar{r}_{t,W})(r_{t-i-l}-\bar{r}_{t-l,W})}_{\text{Lagged Auto-Covariance}} + \underbrace{\text{Quantile}_q\!\left(\left\{\frac{1}{w}\sum_{j=0}^{w-1}r^2_{t-k-j}\right\}_{k=0}^{K}\right)}_{\text{Volatility Floor}}$$
+$$
+S(t,l) = \max \left( \frac{1}{W-l} \sum_{i=0}^{W-l-1} (r_{t-i}-\bar{r}_{t,W})(r_{t-i-l}-\bar{r}_{t-l,W}), \text{Quantile}_q \left( \left\lbrace \frac{1}{W} \sum_{j=0}^{W-1} r^2_{t-k-j} \right\rbrace_{k=0}^{K} \right) \right)
+$$
 
 **Part 1 – Lagged Auto-Covariance:** measures whether past returns predict current returns (serial correlation) over a rolling window *W* at lag *l*.
 
