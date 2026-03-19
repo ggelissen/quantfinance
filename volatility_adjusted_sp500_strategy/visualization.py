@@ -9,6 +9,11 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    from scipy.ndimage import gaussian_filter
+except Exception:  # pragma: no cover - optional dependency fallback
+    gaussian_filter = None
+
 
 # ---------------------------------------------------------------------------
 # Dark-mode colour palette
@@ -36,7 +41,10 @@ _DARK_LAYOUT = dict(
 def plot_volatility_surface(surface_df: pd.DataFrame,
                              title: str = "Volatility Surface — S(t, l)",
                              colorscale: str = "Plasma",
-                             last_n_days: int = 252) -> go.Figure:
+                             last_n_days: int = 252,
+                             smoothing_sigma: float = 1.2,
+                             color_low_percentile: float = 5.0,
+                             color_high_percentile: float = 95.0) -> go.Figure:
     """Render an interactive 3D volatility surface.
 
     Parameters
@@ -50,6 +58,13 @@ def plot_volatility_surface(surface_df: pd.DataFrame,
         Plotly colour scale name. Default 'Plasma'.
     last_n_days : int, optional
         How many of the most-recent trading days to show. Default 252 (1 year).
+    smoothing_sigma : float, optional
+        Gaussian smoothing strength applied to the Z matrix before plotting.
+        Set to 0 to disable. Default 1.2.
+    color_low_percentile : float, optional
+        Lower percentile for dynamic color-scale clamping. Default 5.
+    color_high_percentile : float, optional
+        Upper percentile for dynamic color-scale clamping. Default 95.
 
     Returns
     -------
@@ -62,6 +77,21 @@ def plot_volatility_surface(surface_df: pd.DataFrame,
     dates = df.index
     z_matrix = df.values.T  # shape: (n_lags, n_dates)
 
+    if smoothing_sigma > 0 and gaussian_filter is not None:
+        z_plot = gaussian_filter(z_matrix, sigma=float(smoothing_sigma))
+    else:
+        z_plot = z_matrix
+
+    finite = z_plot[np.isfinite(z_plot)]
+    if finite.size > 0:
+        cmin = float(np.percentile(finite, color_low_percentile))
+        cmax = float(np.percentile(finite, color_high_percentile))
+        if not np.isfinite(cmin) or not np.isfinite(cmax) or cmax <= cmin:
+            cmin = float(np.min(finite))
+            cmax = float(np.max(finite))
+    else:
+        cmin, cmax = 0.0, 1.0
+
     # Map dates to numeric indices for the 3D axis
     x_indices = np.arange(len(dates))
     date_labels = [str(d)[:10] for d in dates]
@@ -70,10 +100,25 @@ def plot_volatility_surface(surface_df: pd.DataFrame,
         go.Surface(
             x=x_indices,
             y=lags,
-            z=z_matrix,
+            z=z_plot,
             colorscale=colorscale,
             opacity=0.92,
             showscale=True,
+            cmin=cmin,
+            cmax=cmax,
+            contours=dict(
+                x=dict(show=False),
+                y=dict(show=False),
+                z=dict(show=False),
+            ),
+            lighting=dict(
+                ambient=0.6,
+                diffuse=0.5,
+                roughness=0.5,
+                specular=0.6,
+                fresnel=0.2,
+            ),
+            lightposition=dict(x=120, y=180, z=80),
             colorbar=dict(
                 title=dict(text="S(t,l)", font=dict(color=TEXT_COLOR)),
                 tickfont=dict(color=TEXT_COLOR),
@@ -188,7 +233,7 @@ def plot_equity_and_signals(portfolio: pd.DataFrame, data: pd.DataFrame,
     )
 
     # Mark long entry points
-    long_mask = (position == 1) & (position.shift(1) != 1)
+    long_mask = (position > 0) & (position.shift(1).fillna(0.0) <= 0)
     long_entries = equity[long_mask]
     if not long_entries.empty:
         fig.add_trace(
@@ -203,7 +248,7 @@ def plot_equity_and_signals(portfolio: pd.DataFrame, data: pd.DataFrame,
         )
 
     # Mark short entry points
-    short_mask = (position == -1) & (position.shift(1) != -1)
+    short_mask = (position < 0) & (position.shift(1).fillna(0.0) >= 0)
     short_entries = equity[short_mask]
     if not short_entries.empty:
         fig.add_trace(

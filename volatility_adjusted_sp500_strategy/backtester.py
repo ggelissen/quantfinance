@@ -18,7 +18,7 @@ def run_backtest(data: pd.DataFrame, positions: pd.Series,
     data : pd.DataFrame
         Must contain columns ``close`` and ``returns``.
     positions : pd.Series
-        Integer positions (+1, 0, -1).
+        Position multipliers (e.g. 1.2, 0.5, 0, -1).
     initial_capital : float, optional
         Starting capital in dollars. Default 10 000.
     transaction_cost : float, optional
@@ -31,22 +31,31 @@ def run_backtest(data: pd.DataFrame, positions: pd.Series,
         ``sharpe_ratio``, ``metrics``.
     """
     # Align positions to returns index and shift by 1 day
-    shifted = positions.shift(1).reindex(data.index).fillna(0)
+    shifted = positions.shift(1).reindex(data.index).fillna(0.0).astype(float)
 
-    daily_returns = data["returns"].reindex(shifted.index).fillna(0.0)
-    strategy_returns = shifted * daily_returns
+    daily_returns = data["returns"].reindex(shifted.index).fillna(0.0).astype(float)
 
-    # Transaction costs: charged when position changes
-    trades = shifted.diff().abs().fillna(0)
-    trade_costs = trades * transaction_cost
+    # Transaction costs: charged when exposure changes
+    trades = shifted.diff().abs().fillna(0.0)
+    trade_costs = trades * float(transaction_cost)
 
-    # Build portfolio value
-    portfolio_value = pd.Series(index=data.index, dtype=float)
-    portfolio_value.iloc[0] = initial_capital
+    # Build compounded portfolio path
+    n = len(daily_returns)
+    equity = np.empty(n, dtype=float)
+    net_returns = np.empty(n, dtype=float)
 
-    cum_pnl = strategy_returns.cumsum() * initial_capital
-    cum_costs = trade_costs.cumsum()
-    portfolio_value = initial_capital + cum_pnl - cum_costs
+    equity[0] = float(initial_capital)
+    net_returns[0] = 0.0
+
+    for i in range(1, n):
+        gross_multiplier = 1.0 + shifted.iloc[i] * daily_returns.iloc[i]
+        next_equity = equity[i - 1] * gross_multiplier - trade_costs.iloc[i]
+        equity[i] = max(next_equity, 0.0)
+        prev_equity = equity[i - 1]
+        net_returns[i] = (equity[i] / prev_equity - 1.0) if prev_equity > 0 else 0.0
+
+    portfolio_value = pd.Series(equity, index=data.index, dtype=float)
+    strategy_returns = pd.Series(net_returns, index=data.index, dtype=float)
 
     portfolio = pd.DataFrame({
         "portfolio_value": portfolio_value,

@@ -114,6 +114,11 @@ def generate_video(
     initial_capital = float(port["portfolio_value"].iloc[0])
     bh_values = close / float(close.iloc[0]) * initial_capital
 
+    # Index-normalised series for visual comparability (base = 100)
+    base_index = 100.0
+    port_idx = port["portfolio_value"] / initial_capital * base_index
+    bh_idx = bh_values / initial_capital * base_index
+
     # Global Z bounds for a consistent colour scale across all frames
     z_all = surf.values
     z_min = float(np.nanmin(z_all))
@@ -144,12 +149,13 @@ def generate_video(
         img = _render_frame(
             surf=surf,
             port=port,
-            bh_values=bh_values,
+            port_idx=port_idx,
+            bh_idx=bh_idx,
             dates=dates,
             lags=lags,
             t_idx=t_idx,
             surface_window=surface_window,
-            initial_capital=initial_capital,
+            base_index=base_index,
             z_min=z_min,
             z_max=z_max,
         )
@@ -174,12 +180,13 @@ def generate_video(
 def _render_frame(
     surf: pd.DataFrame,
     port: pd.DataFrame,
-    bh_values: pd.Series,
+    port_idx: pd.Series,
+    bh_idx: pd.Series,
     dates,
     lags: np.ndarray,
     t_idx: int,
     surface_window: int,
-    initial_capital: float,
+    base_index: float,
     z_min: float,
     z_max: float,
 ) -> np.ndarray:
@@ -211,8 +218,10 @@ def _render_frame(
     X, Y = np.meshgrid(x_idx, lags)
     Z = surf_win.values.T  # (n_lags, n_days)
 
+    X_plot, Y_plot, Z_plot = _smooth_surface(X, Y, Z)
+
     surf_plot = ax3d.plot_surface(
-        X, Y, Z,
+        X_plot, Y_plot, Z_plot,
         cmap="plasma",
         vmin=z_min, vmax=z_max,
         alpha=0.88,
@@ -220,16 +229,22 @@ def _render_frame(
         antialiased=True,
     )
 
-    # Floating magenta diamond at the most-recent day, smallest lag
-    latest_z = float(surf_win.iloc[-1, 0])
+    # Floating magenta diamond follows regime + current surface structure
+    x_marker, y_marker, z_marker = _dynamic_marker_coords(
+        surf=surf,
+        port=port,
+        lags=lags,
+        t_idx=t_idx,
+        t_start=t_start,
+    )
     ax3d.scatter(
-        [len(surf_win) - 1], [lags[0]], [latest_z],
+        [x_marker], [y_marker], [z_marker],
         color=_MAGENTA, s=140, marker="D", zorder=10, depthshade=False,
     )
 
     # Axis labels and style
     ax3d.set_xlabel("Tau", color=_TEXT, fontsize=8, labelpad=4)
-    ax3d.set_ylabel("Kernel Offset", color=_TEXT, fontsize=8, labelpad=4)
+    ax3d.set_ylabel("Lag", color=_TEXT, fontsize=8, labelpad=4)
     ax3d.set_zlabel("Vol", color=_TEXT, fontsize=8, labelpad=4)
     ax3d.tick_params(colors=_TEXT, labelsize=6)
     for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
@@ -271,13 +286,19 @@ def _render_frame(
     ax_mid.axis("off")
 
     current_date = str(dates[t_idx])[:10]
-    strat_val = float(port["portfolio_value"].iloc[t_idx])
-    position = int(port["position"].iloc[t_idx])
+    strat_val = float(port_idx.iloc[t_idx])
+    exposure = float(port["position"].iloc[t_idx])
 
-    if position == 1:
+    if exposure >= 1.05:
+        pos_label = f"{exposure:.1f}x LEV"
+        pos_color = _GREEN
+    elif exposure >= 0.75:
         pos_label = "100% LONG"
         pos_color = _GREEN
-    elif position == -1:
+    elif exposure > 0.0:
+        pos_label = f"{int(round(exposure * 100))}% LONG"
+        pos_color = _ORANGE
+    elif exposure <= -0.75:
         pos_label = "100% BEAR"
         pos_color = _RED
     else:
@@ -286,7 +307,7 @@ def _render_frame(
 
     readout_items = [
         (0.01, f"Date:     {current_date}", _TEXT),
-        (0.35, f"Strategy: ${strat_val:,.0f}", _GREEN),
+        (0.35, f"Strategy: IDX {strat_val:,.1f}", _GREEN),
         (0.68, f"Position: {pos_label}", pos_color),
     ]
     for x_frac, txt, col in readout_items:
@@ -306,8 +327,8 @@ def _render_frame(
     ax2d = fig.add_subplot(gs[2])
     ax2d.set_facecolor(_BG)
 
-    hist_port = port["portfolio_value"].iloc[: t_idx + 1]
-    hist_bh = bh_values.iloc[: t_idx + 1]
+    hist_port = port_idx.iloc[: t_idx + 1]
+    hist_bh = bh_idx.iloc[: t_idx + 1]
     hist_pos = port["position"].iloc[: t_idx + 1]
     hist_dates = dates[: t_idx + 1]
 
@@ -326,13 +347,13 @@ def _render_frame(
     if len(hist_dates) > 0:
         ax2d.text(
             hist_dates[-1], float(hist_port.iloc[-1]),
-            f"  ${hist_port.iloc[-1]:,.0f}",
+            f"  {hist_port.iloc[-1]:,.1f}",
             color=_GREEN, fontsize=6.5, va="center", fontfamily="monospace",
             clip_on=True,
         )
         ax2d.text(
             hist_dates[-1], float(hist_bh.iloc[-1]),
-            f"  ${hist_bh.iloc[-1]:,.0f}",
+            f"  {hist_bh.iloc[-1]:,.1f}",
             color=_ORANGE, fontsize=6.5, va="center", fontfamily="monospace",
             clip_on=True,
         )
@@ -356,7 +377,7 @@ def _render_frame(
     # Axes style
     ax2d.set_xlim(dates[0], dates[-1])
     ax2d.set_xlabel("Year", color=_TEXT, fontsize=8)
-    ax2d.set_ylabel("Portfolio Value ($)", color=_TEXT, fontsize=8)
+    ax2d.set_ylabel(f"Indexed Value (Base={int(base_index)})", color=_TEXT, fontsize=8)
     ax2d.tick_params(colors=_TEXT, labelsize=7)
     for spine_name, spine in ax2d.spines.items():
         spine.set_color(_CYAN if spine_name in ("bottom", "left") else "#1e1e1e")
@@ -387,22 +408,87 @@ def _fig_to_bgr(fig: plt.Figure) -> np.ndarray:
 
 
 def _draw_regime_bars(ax, dates, position: pd.Series) -> None:
-    """Shade non-long (flat / short) periods with semi-transparent orange bars."""
+    """Shade defensive and bear regimes for visual regime transitions."""
     if len(dates) < 2:
         return
     dates_arr = np.array(dates, dtype="datetime64[ns]")
-    pos_arr = position.values
-    in_regime = False
-    start = None
-    for d, p in zip(dates_arr, pos_arr):
-        if p != 1 and not in_regime:
-            in_regime = True
-            start = d
-        elif p == 1 and in_regime:
-            ax.axvspan(start, d, color=_ORANGE, alpha=0.13, linewidth=0)
-            in_regime = False
-    if in_regime and start is not None:
-        ax.axvspan(start, dates_arr[-1], color=_ORANGE, alpha=0.13, linewidth=0)
+    pos_arr = position.values.astype(float)
+
+    def _shade(mask: np.ndarray, color: str, alpha: float) -> None:
+        in_regime = False
+        start = None
+        for d, is_on in zip(dates_arr, mask):
+            if is_on and not in_regime:
+                in_regime = True
+                start = d
+            elif not is_on and in_regime:
+                ax.axvspan(start, d, color=color, alpha=alpha, linewidth=0)
+                in_regime = False
+        if in_regime and start is not None:
+            ax.axvspan(start, dates_arr[-1], color=color, alpha=alpha, linewidth=0)
+
+    _shade((pos_arr >= 0.0) & (pos_arr < 1.0), _ORANGE, 0.12)
+    _shade(pos_arr < 0.0, _RED, 0.14)
+
+
+def _smooth_surface(X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
+                    upsample_factor: int = 3,
+                    sigma: float = 1.1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Upsample + Gaussian smooth the surface for a less blocky 3D mesh."""
+    n_lags, n_days = Z.shape
+    if n_lags < 2 or n_days < 2:
+        return X, Y, Z
+
+    x_src = np.arange(n_days, dtype=float)
+    y_src = np.arange(n_lags, dtype=float)
+
+    x_fine = np.linspace(0.0, n_days - 1.0, n_days * upsample_factor)
+    y_fine = np.linspace(0.0, n_lags - 1.0, n_lags * upsample_factor)
+
+    z_x = np.vstack([np.interp(x_fine, x_src, Z[row, :]) for row in range(n_lags)])
+    z_xy = np.vstack([
+        np.interp(y_fine, y_src, z_x[:, col])
+        for col in range(z_x.shape[1])
+    ]).T
+
+    z_smooth = cv2.GaussianBlur(z_xy.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    x_mesh, y_mesh_idx = np.meshgrid(x_fine, y_fine)
+    lag_min = float(np.min(Y))
+    lag_max = float(np.max(Y))
+    y_mesh = lag_min + (lag_max - lag_min) * (y_mesh_idx / (n_lags - 1.0))
+    return x_mesh, y_mesh, z_smooth
+
+
+def _dynamic_marker_coords(
+    surf: pd.DataFrame,
+    port: pd.DataFrame,
+    lags: np.ndarray,
+    t_idx: int,
+    t_start: int,
+) -> tuple[float, float, float]:
+    """Set marker coordinates from current regime and recent volatility structure."""
+    surf_win = surf.iloc[t_start: t_idx + 1]
+    vol_slice = surf.iloc[t_idx].values.astype(float)
+    exposure = float(port["position"].iloc[t_idx])
+
+    if exposure < 0.0:
+        lag_idx = int(np.argmax(vol_slice))
+    elif exposure >= 1.0:
+        lag_idx = int(np.argmin(vol_slice))
+    else:
+        lag_idx = int(np.argmin(np.abs(vol_slice - np.nanmedian(vol_slice))))
+
+    regime_history = port["position"].iloc[t_start: t_idx + 1].values.astype(float)
+    x_pos = len(surf_win) - 1
+    for i in range(len(regime_history) - 2, -1, -1):
+        if regime_history[i] != regime_history[-1]:
+            x_pos = i + 1
+            break
+
+    z_val = float(surf_win.iloc[x_pos, lag_idx])
+    y_val = float(lags[lag_idx])
+    return float(x_pos), y_val, z_val
 
 
 def _try_open_video(path: str) -> None:

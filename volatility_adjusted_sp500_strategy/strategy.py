@@ -26,6 +26,7 @@ The position rule is:
 
 import numpy as np
 import pandas as pd
+from typing import Optional
 
 
 def _rolling_autocovariance(returns: pd.Series, window: int, lag: int) -> pd.Series:
@@ -123,7 +124,7 @@ def _rolling_volatility_floor(returns: pd.Series, sub_window: int, k_windows: in
 
 
 def compute_signal(returns: pd.Series, window: int = 60, lag: int = 1,
-                   sub_window: int = None, k_windows: int = 10,
+                   sub_window: Optional[int] = None, k_windows: int = 10,
                    quantile: float = 0.25) -> pd.Series:
     """Compute the composite signal S(t, l) = max(AutoCov, VolFloor).
 
@@ -172,50 +173,154 @@ def compute_signal(returns: pd.Series, window: int = 60, lag: int = 1,
 
 def generate_positions(signal: pd.Series, rolling_window: int = 252,
                        low_quantile: float = 0.4, high_quantile: float = 0.6,
-                       allow_short: bool = False) -> pd.Series:
-    """Convert the composite signal into trade positions using rolling quantile thresholds.
+                       allow_short: bool = True,
+                       returns: pd.Series | None = None,
+                       prices: pd.Series | None = None,
+                       low_vol_leverage: float = 1.2,
+                       moderate_exposure: float = 0.5,
+                       flat_exposure: float = 0.0,
+                       high_vol_bear_exposure: float = -1.0,
+                       trend_window: int = 20,
+                       target_volatility: float = 0.15,
+                       ewma_vol_span: int = 20,
+                       trend_sma_window: int = 200,
+                       min_target_exposure: float = 0.0,
+                       max_target_exposure: float = 2.0) -> pd.Series:
+    """Convert signal into regime-aware floating exposures.
 
-    The signal S(t, l) represents the current volatility regime.  Rather than
-    comparing to a fixed threshold, we compare it to rolling quantiles of its
-    own history so that the strategy adapts to changing market regimes:
+    The signal S(t, l) is mapped to three regimes using rolling quantiles,
+    then scaled by target volatility:
 
-    * signal < rolling low_quantile   → Long  (+1)  — low-vol regime
-    * signal > rolling high_quantile  → Short (-1) if allow_short else Flat (0)
-    * otherwise                        → Flat  ( 0)
+        * signal < rolling low_quantile   → Low volatility regime (levered long)
+        * signal > rolling high_quantile  → High volatility regime (bear / flat,
+            but buy-the-dip when price is above long-term trend)
+        * otherwise                       → Moderate regime (partial or flat)
+
+        Volatility targeting:
+        * Uses EWMA annualized volatility estimate.
+        * Base exposure = target_volatility / current_ewma_vol (clipped).
+
+        Moderate regime handling:
+    * if ``returns`` is provided and short-term momentum is positive,
+      use ``moderate_exposure``
+    * otherwise use ``flat_exposure``
 
     Parameters
     ----------
     signal : pd.Series
         Output of :func:`compute_signal`.
     rolling_window : int, optional
-        Look-back window for computing rolling quantile thresholds. Default 252.
+        Look-back window for rolling quantile thresholds. Default 252.
     low_quantile : float, optional
-        Signal below this rolling quantile triggers a long. Default 0.4.
+        Lower rolling quantile for low-vol regime. Default 0.4.
     high_quantile : float, optional
-        Signal above this rolling quantile triggers a short / exit. Default 0.6.
+        Upper rolling quantile for high-vol regime. Default 0.6.
     allow_short : bool, optional
-        Whether to allow short positions. Default False.
+        Allow negative exposure in high-vol regime. Default True.
+    returns : pd.Series or None, optional
+        Daily returns used for moderate-regime trend filter.
+    prices : pd.Series or None, optional
+        Price series used for long-term trend filter (SMA).
+    low_vol_leverage : float, optional
+        Exposure in low-vol regime. Default 1.2.
+    moderate_exposure : float, optional
+        Exposure in moderate regime when trend is supportive. Default 0.5.
+    flat_exposure : float, optional
+        Exposure in moderate regime when trend is not supportive. Default 0.0.
+    high_vol_bear_exposure : float, optional
+        Exposure in high-vol regime (typically -1.0). Default -1.0.
+    trend_window : int, optional
+        Rolling window for momentum filter on ``returns``. Default 20.
+    target_volatility : float, optional
+        Target annualized volatility used to scale exposure. Default 0.15.
+    ewma_vol_span : int, optional
+        Span for EWMA volatility estimation. Default 20.
+    trend_sma_window : int, optional
+        Long-term trend window for buy-the-dip logic. Default 200.
+    min_target_exposure : float, optional
+        Minimum clip for base target-vol exposure. Default 0.0.
+    max_target_exposure : float, optional
+        Maximum clip for base target-vol exposure. Default 2.0.
 
     Returns
     -------
     pd.Series
-        Integer positions (+1, 0, -1) indexed by date.
+        Floating position multipliers indexed by date.
     """
-    low_thresh = signal.rolling(rolling_window, min_periods=rolling_window // 2).quantile(low_quantile)
-    high_thresh = signal.rolling(rolling_window, min_periods=rolling_window // 2).quantile(high_quantile)
+    low_thresh = signal.rolling(
+        rolling_window,
+        min_periods=rolling_window // 2,
+    ).quantile(low_quantile)
+    high_thresh = signal.rolling(
+        rolling_window,
+        min_periods=rolling_window // 2,
+    ).quantile(high_quantile)
 
-    positions = pd.Series(0, index=signal.index, name="position", dtype=int)
-    positions[signal < low_thresh] = 1
-    if allow_short:
-        positions[signal > high_thresh] = -1
+    aligned_returns = None
+    if returns is not None:
+        aligned_returns = returns.reindex(signal.index)
+        momentum = aligned_returns.rolling(
+            trend_window,
+            min_periods=max(5, trend_window // 2),
+        ).mean()
+        moderate_mask = momentum > 0
+
+        ewma_vol = aligned_returns.ewm(
+            span=ewma_vol_span,
+            adjust=False,
+            min_periods=max(5, ewma_vol_span // 2),
+        ).std() * np.sqrt(252)
+        base_exposure = (target_volatility / ewma_vol.replace(0.0, np.nan)).clip(
+            lower=min_target_exposure,
+            upper=max_target_exposure,
+        )
+        base_exposure = base_exposure.fillna(float(moderate_exposure)).astype(float)
+    else:
+        moderate_mask = pd.Series(True, index=signal.index)
+        base_exposure = pd.Series(float(moderate_exposure), index=signal.index, dtype=float)
+
+    if prices is not None:
+        aligned_prices = prices.reindex(signal.index)
+        sma_long = aligned_prices.rolling(
+            trend_sma_window,
+            min_periods=max(20, trend_sma_window // 2),
+        ).mean()
+        bull_trend = aligned_prices >= sma_long
+    else:
+        bull_trend = pd.Series(False, index=signal.index)
+
+    positions = pd.Series(flat_exposure, index=signal.index, name="position", dtype=float)
+
+    low_regime = signal < low_thresh
+    high_regime = signal > high_thresh
+    moderate_regime = ~(low_regime | high_regime)
+
+    positions[low_regime] = (base_exposure[low_regime] * float(low_vol_leverage)).values
+
+    high_exposure = float(high_vol_bear_exposure if allow_short else flat_exposure)
+    high_bear_mask = high_regime & ~bull_trend
+    high_bull_mask = high_regime & bull_trend
+    positions[high_bear_mask] = high_exposure
+    positions[high_bull_mask] = (
+        base_exposure[high_bull_mask] * float(low_vol_leverage)
+    ).values
+
+    positions[moderate_regime & moderate_mask] = (
+        base_exposure[moderate_regime & moderate_mask] * float(moderate_exposure)
+    ).values
+    positions[moderate_regime & ~moderate_mask] = float(flat_exposure)
+
     return positions
 
 
 def build_volatility_surface(returns: pd.Series, window: int = 60,
                               lag_range: range = range(1, 31),
-                              sub_window: int = None, k_windows: int = 10,
-                              quantile: float = 0.25) -> pd.DataFrame:
-    """Compute S(t, l) for a range of lags to produce a volatility surface.
+                              use_magnitude: bool = True) -> pd.DataFrame:
+    """Compute rolling lag-kernel values for a range of lags.
+
+    This surface is built from rolling lagged auto-covariance, not the
+    composite signal max(AutoCov, VolFloor), so variation along the lag axis
+    is preserved.
 
     Parameters
     ----------
@@ -225,13 +330,8 @@ def build_volatility_surface(returns: pd.Series, window: int = 60,
         Auto-covariance window W. Default 60.
     lag_range : range or list of int, optional
         Lags l to compute. Default range(1, 31).
-    sub_window : int or None, optional
-        Override for the realised-variance sub-window.  If ``None`` (default),
-        uses ``window`` (W) per the improved formula.
-    k_windows : int, optional
-        Number K for the volatility floor. Default 10.
-    quantile : float, optional
-        Quantile level q. Default 0.25.
+    use_magnitude : bool, optional
+        If True, use absolute auto-covariance magnitude. Default True.
 
     Returns
     -------
@@ -240,7 +340,8 @@ def build_volatility_surface(returns: pd.Series, window: int = 60,
     """
     surface = {}
     for lag in lag_range:
-        surface[lag] = compute_signal(returns, window=window, lag=lag,
-                                      sub_window=sub_window, k_windows=k_windows,
-                                      quantile=quantile)
+        series = _rolling_autocovariance(returns, window=window, lag=lag)
+        if use_magnitude:
+            series = series.abs()
+        surface[lag] = series
     return pd.DataFrame(surface)

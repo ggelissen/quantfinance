@@ -20,18 +20,22 @@ $$
 
 ### Position Rule
 
-| Signal S(t, l)    | Position |
-|-------------------|----------|
-| < -`vol_threshold` | Long (+1) |
-| > +`vol_threshold` | Short (−1) if `allow_short=True`, else Flat (0) |
-| otherwise          | Flat (0) |
+| Regime | Exposure |
+|---|---|
+| Low-vol regime | Target-vol exposure × `low_vol_leverage` |
+| Moderate regime | Target-vol exposure × `moderate_exposure` (or `flat_exposure` if momentum filter fails) |
+| High-vol regime, price below 200-SMA | `high_vol_bear_exposure` (or `flat_exposure` when `allow_short=False`) |
+| High-vol regime, price above 200-SMA | Buy-the-dip (same levered long profile as low-vol regime) |
 
-> Low / mean-reverting volatility → Long.  
-> Volatility spike → exit or short.
+Base target-vol exposure uses EWMA annualized volatility:
+
+$$
+	ext{Base Exposure}_t = \text{clip}\left(\frac{\text{Target Vol}}{\hat{\sigma}^{\text{EWMA}}_t},\; \text{min},\; \text{max}\right)
+$$
 
 ### Visualisations (Dark Mode)
 
-1. **3D Interactive Volatility Surface** — `S(t, l)` plotted over time (x), lag (y), and signal magnitude (z) using Plotly with a *Plasma* colour scale.
+1. **3D Interactive Lag-Kernel Surface** — rolling lagged auto-covariance magnitude plotted over time (x), lag (y), and kernel magnitude (z) using Plotly with a *Plasma* colour scale, Gaussian smoothing, percentile-based color clamping, and modern lighting.
 2. **Equity Curve Dashboard** — three-panel dark-mode chart: S&P 500 price, portfolio value with entry markers, and position bars.
 3. **Rolling Volatility Regimes** — annualised 21-day, 63-day, and 126-day rolling volatility.
 
@@ -44,6 +48,7 @@ $$
 | Data download | `yfinance` |
 | Numerical computation | `numpy`, `pandas` |
 | Interactive 3D charts | `plotly` |
+| Surface smoothing | `scipy` (optional, Gaussian filter) |
 | 2D / animated charts | `matplotlib` |
 | (Optional) risk models | `scikit-learn` |
 
@@ -54,7 +59,7 @@ All libraries are free and open-source.
 ## Installation
 
 ```bash
-pip install yfinance numpy pandas plotly matplotlib scikit-learn
+pip install yfinance numpy pandas plotly matplotlib scipy scikit-learn
 ```
 
 ---
@@ -75,11 +80,23 @@ main(
     ticker="^GSPC",        # S&P 500
     window=60,             # auto-covariance window W
     lag=1,                 # lag l
-    sub_window=21,         # realised-variance sub-window w
+    sub_window=None,       # if None, uses window
     k_windows=10,          # number of sub-windows K
     quantile=0.25,         # volatility-floor quantile q
-    vol_threshold=0.0,     # signal entry threshold
-    allow_short=False,     # allow short positions
+    rolling_window=252,    # rolling threshold window
+    low_quantile=0.40,
+    high_quantile=0.60,
+    allow_short=False,
+    low_vol_leverage=1.8,
+    moderate_exposure=1.0,
+    flat_exposure=0.0,
+    high_vol_bear_exposure=0.0,
+    trend_window=10,
+    target_volatility=0.15,
+    ewma_vol_span=20,
+    trend_sma_window=200,
+    min_target_exposure=0.0,
+    max_target_exposure=2.0,
     initial_capital=10_000.0,
     transaction_cost=1.0,
     show_plots=True,

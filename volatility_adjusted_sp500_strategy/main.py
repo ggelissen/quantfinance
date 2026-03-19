@@ -17,12 +17,13 @@ Strategy overview
    mean-reverting vol), flat (or short) when it spikes above a threshold.
 4. Run a daily back-test with flat transaction costs.
 5. Display:
-   - An interactive 3D volatility surface (S(t, l) over time and lag).
+    - An interactive 3D lag-kernel surface (rolling auto-covariance magnitude over time and lag).
    - A dark-mode equity-curve dashboard with entry markers.
    - A rolling volatility regime chart.
 """
 
 import time
+from typing import Optional
 
 import pandas as pd
 
@@ -45,7 +46,7 @@ def main(
     # Signal parameters
     window: int = 60,
     lag: int = 1,
-    sub_window: int = None,
+    sub_window: Optional[int] = None,
     k_windows: int = 10,
     quantile: float = 0.25,
     # Position parameters
@@ -53,6 +54,16 @@ def main(
     low_quantile: float = 0.4,
     high_quantile: float = 0.6,
     allow_short: bool = False,
+    low_vol_leverage: float = 1.8,
+    moderate_exposure: float = 1.0,
+    flat_exposure: float = 0.0,
+    high_vol_bear_exposure: float = 0.0,
+    trend_window: int = 10,
+    target_volatility: float = 0.15,
+    ewma_vol_span: int = 20,
+    trend_sma_window: int = 200,
+    min_target_exposure: float = 0.0,
+    max_target_exposure: float = 2.0,
     # Back-test parameters
     initial_capital: float = 10_000.0,
     transaction_cost: float = 1.0,
@@ -98,7 +109,28 @@ def main(
     high_quantile : float, optional
         Signal above this rolling quantile triggers short / exit. Default 0.6.
     allow_short : bool, optional
-        Allow short positions. Default False.
+        Allow negative exposure in high-volatility regimes. Default True.
+    low_vol_leverage : float, optional
+        Exposure multiplier in low-volatility regimes. Default 1.2.
+    moderate_exposure : float, optional
+        Exposure in moderate regimes when trend is supportive. Default 0.5.
+    flat_exposure : float, optional
+        Exposure in moderate regimes when trend is not supportive. Default 0.0.
+    high_vol_bear_exposure : float, optional
+        Exposure in high-volatility regimes (typically -1.0). Default -1.0.
+    trend_window : int, optional
+        Window for moderate-regime momentum filter. Default 20.
+    target_volatility : float, optional
+        Target annualized volatility for dynamic exposure scaling. Default 0.15.
+    ewma_vol_span : int, optional
+        Span of EWMA volatility estimator. Default 20.
+    trend_sma_window : int, optional
+        Long-term SMA window used for buy-the-dip gating in high-vol regimes.
+        Default 200.
+    min_target_exposure : float, optional
+        Lower clip bound for target-vol base exposure. Default 0.0.
+    max_target_exposure : float, optional
+        Upper clip bound for target-vol base exposure. Default 2.0.
     initial_capital : float, optional
         Starting capital in dollars. Default 10 000.
     transaction_cost : float, optional
@@ -131,7 +163,7 @@ def main(
     # ------------------------------------------------------------------
     # 1. Data
     # ------------------------------------------------------------------
-    print(f"Downloading {display_name} data ({start_date} → {end_date}) …")
+    print(f"Downloading {display_name} data ({start_date} -> {end_date}) ...")
     data = download_sp500_data(start_date, end_date, ticker=ticker)
     print(f"  {len(data)} trading days loaded.")
 
@@ -140,7 +172,7 @@ def main(
     # ------------------------------------------------------------------
     # 2. Signal & positions
     # ------------------------------------------------------------------
-    print("Computing composite signal S(t, l) …")
+    print("Computing composite signal S(t, l) ...")
     signal = compute_signal(
         returns,
         window=window,
@@ -149,22 +181,39 @@ def main(
         k_windows=k_windows,
         quantile=quantile,
     )
-    positions = generate_positions(signal, rolling_window=rolling_window,
-                                   low_quantile=low_quantile,
-                                   high_quantile=high_quantile,
-                                   allow_short=allow_short)
+    positions = generate_positions(
+        signal,
+        rolling_window=rolling_window,
+        low_quantile=low_quantile,
+        high_quantile=high_quantile,
+        allow_short=allow_short,
+        returns=returns,
+        prices=data["close"],
+        low_vol_leverage=low_vol_leverage,
+        moderate_exposure=moderate_exposure,
+        flat_exposure=flat_exposure,
+        high_vol_bear_exposure=high_vol_bear_exposure,
+        trend_window=trend_window,
+        target_volatility=target_volatility,
+        ewma_vol_span=ewma_vol_span,
+        trend_sma_window=trend_sma_window,
+        min_target_exposure=min_target_exposure,
+        max_target_exposure=max_target_exposure,
+    )
 
     # ------------------------------------------------------------------
     # 3. Back-test
     # ------------------------------------------------------------------
-    print("Running back-test …")
+    print("Running back-test ...")
     results = run_backtest(data, positions, initial_capital=initial_capital,
                            transaction_cost=transaction_cost)
 
     portfolio = results["portfolio"]
     metrics = results["metrics"]
+    benchmark_total_return = (data["close"].iloc[-1] / data["close"].iloc[0] - 1.0) * 100.0
+    excess_return = metrics["total_return"] - benchmark_total_return
 
-    print("\n── Performance Summary ─────────────────────────────────────")
+    print("\n-- Performance Summary -------------------------------------")
     print(f"  Total Return       : {metrics['total_return']:.2f}%")
     print(f"  Annualised Return  : {metrics['annualized_return']:.2f}%")
     print(f"  Max Drawdown       : {metrics['max_drawdown']:.2f}%")
@@ -172,19 +221,18 @@ def main(
     print(f"  Sortino Ratio      : {metrics['sortino_ratio']:.2f}")
     print(f"  Win Rate           : {metrics['win_rate']:.1f}%")
     print(f"  Profit Factor      : {metrics['profit_factor']:.2f}")
+    print(f"  S&P 500 Return     : {benchmark_total_return:.2f}%")
+    print(f"  Excess Return      : {excess_return:.2f}%")
     print("─" * 60)
 
     # ------------------------------------------------------------------
     # 4. Volatility surface
     # ------------------------------------------------------------------
-    print(f"Building volatility surface over lags 1–{lag_range_end - 1} …")
+    print(f"Building volatility surface over lags 1-{lag_range_end - 1} ...")
     surface_df = build_volatility_surface(
         returns,
         window=window,
         lag_range=range(1, lag_range_end),
-        sub_window=sub_window,
-        k_windows=k_windows,
-        quantile=quantile,
     )
 
     # ------------------------------------------------------------------
@@ -223,7 +271,7 @@ def main(
     # 6. Optional: cyberpunk video
     # ------------------------------------------------------------------
     if generate_video:
-        print("Generating strategy video …")
+        print("Generating strategy video ...")
         make_video(
             surface_df=surface_df,
             portfolio=portfolio,
@@ -254,6 +302,16 @@ if __name__ == "__main__":
         low_quantile=0.4,
         high_quantile=0.6,
         allow_short=False,
+        low_vol_leverage=1.8,
+        moderate_exposure=1.0,
+        flat_exposure=0.0,
+        high_vol_bear_exposure=0.0,
+        trend_window=10,
+        target_volatility=0.15,
+        ewma_vol_span=20,
+        trend_sma_window=200,
+        min_target_exposure=0.0,
+        max_target_exposure=2.0,
         # Back-test
         initial_capital=10_000.0,
         transaction_cost=1.0,
@@ -261,10 +319,10 @@ if __name__ == "__main__":
         lag_range_end=31,
         surface_last_n_days=252,
         # Output
-        show_plots=True,
+        show_plots=False,
         save_html=False,
         # Video
-        generate_video=False,
+        generate_video=True,
         video_output_path="volatility_strategy.mp4",
         video_frame_step=5,
         video_show=True,
