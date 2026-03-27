@@ -186,90 +186,43 @@ def generate_positions(signal: pd.Series, rolling_window: int = 252,
                        trend_sma_window: int = 200,
                        min_target_exposure: float = 0.0,
                        max_target_exposure: float = 2.0) -> pd.Series:
-    """Convert signal into regime-aware floating exposures.
+    """Convert signal into regime-aware floating exposures with a fast circuit breaker.
 
     The signal S(t, l) is mapped to three regimes using rolling quantiles,
     then scaled by target volatility:
 
-        * signal < rolling low_quantile   → Low volatility regime (levered long)
+        * signal < rolling low_quantile   → Low volatility regime (levered long, 
+                                            UNLESS fast trend breaks -> cuts to flat)
         * signal > rolling high_quantile  → High volatility regime (bear / flat,
-            but buy-the-dip when price is above long-term trend)
+                                            but buy-the-dip when price is above long-term trend)
         * otherwise                       → Moderate regime (partial or flat)
-
-        Volatility targeting:
-        * Uses EWMA annualized volatility estimate.
-        * Base exposure = target_volatility / current_ewma_vol (clipped).
-
-        Moderate regime handling:
-    * if ``returns`` is provided and short-term momentum is positive,
-      use ``moderate_exposure``
-    * otherwise use ``flat_exposure``
-
-    Parameters
-    ----------
-    signal : pd.Series
-        Output of :func:`compute_signal`.
-    rolling_window : int, optional
-        Look-back window for rolling quantile thresholds. Default 252.
-    low_quantile : float, optional
-        Lower rolling quantile for low-vol regime. Default 0.4.
-    high_quantile : float, optional
-        Upper rolling quantile for high-vol regime. Default 0.6.
-    allow_short : bool, optional
-        Allow negative exposure in high-vol regime. Default True.
-    returns : pd.Series or None, optional
-        Daily returns used for moderate-regime trend filter.
-    prices : pd.Series or None, optional
-        Price series used for long-term trend filter (SMA).
-    low_vol_leverage : float, optional
-        Exposure in low-vol regime. Default 1.2.
-    moderate_exposure : float, optional
-        Exposure in moderate regime when trend is supportive. Default 0.5.
-    flat_exposure : float, optional
-        Exposure in moderate regime when trend is not supportive. Default 0.0.
-    high_vol_bear_exposure : float, optional
-        Exposure in high-vol regime (typically -1.0). Default -1.0.
-    trend_window : int, optional
-        Rolling window for momentum filter on ``returns``. Default 20.
-    target_volatility : float, optional
-        Target annualized volatility used to scale exposure. Default 0.15.
-    ewma_vol_span : int, optional
-        Span for EWMA volatility estimation. Default 20.
-    trend_sma_window : int, optional
-        Long-term trend window for buy-the-dip logic. Default 200.
-    min_target_exposure : float, optional
-        Minimum clip for base target-vol exposure. Default 0.0.
-    max_target_exposure : float, optional
-        Maximum clip for base target-vol exposure. Default 2.0.
-
-    Returns
-    -------
-    pd.Series
-        Floating position multipliers indexed by date.
     """
+    # 1. Calculate thresholds
     low_thresh = signal.rolling(
-        rolling_window,
-        min_periods=rolling_window // 2,
+        rolling_window, 
+        min_periods=rolling_window // 2
     ).quantile(low_quantile)
+    
     high_thresh = signal.rolling(
-        rolling_window,
-        min_periods=rolling_window // 2,
+        rolling_window, 
+        min_periods=rolling_window // 2
     ).quantile(high_quantile)
 
-    aligned_returns = None
+    # 2. Calculate Base Exposure via Risk Parity
     if returns is not None:
         aligned_returns = returns.reindex(signal.index)
         momentum = aligned_returns.rolling(
-            trend_window,
-            min_periods=max(5, trend_window // 2),
+            trend_window, 
+            min_periods=max(5, trend_window // 2)
         ).mean()
         moderate_mask = momentum > 0
 
         ewma_vol = aligned_returns.ewm(
-            span=ewma_vol_span,
-            adjust=False,
-            min_periods=max(5, ewma_vol_span // 2),
+            span=ewma_vol_span, 
+            adjust=False, 
+            min_periods=max(5, ewma_vol_span // 2)
         ).std() * np.sqrt(252)
+        
         base_exposure = (target_volatility / ewma_vol.replace(0.0, np.nan)).clip(
             lower=min_target_exposure,
             upper=max_target_exposure,
@@ -279,36 +232,57 @@ def generate_positions(signal: pd.Series, rolling_window: int = 252,
         moderate_mask = pd.Series(True, index=signal.index)
         base_exposure = pd.Series(float(moderate_exposure), index=signal.index, dtype=float)
 
+    # 3. Calculate Trend Filters (Macro and Fast Circuit Breaker)
     if prices is not None:
         aligned_prices = prices.reindex(signal.index)
+        
+        # Long-term macro trend (200 SMA)
         sma_long = aligned_prices.rolling(
-            trend_sma_window,
-            min_periods=max(20, trend_sma_window // 2),
+            trend_sma_window, 
+            min_periods=max(20, trend_sma_window // 2)
         ).mean()
         bull_trend = aligned_prices >= sma_long
+        
+        # Fast Circuit Breaker (50 EMA) to stop the lag trap
+        ema_fast = aligned_prices.ewm(span=50, adjust=False).mean()
+        fast_trend_safe = aligned_prices >= ema_fast
     else:
         bull_trend = pd.Series(False, index=signal.index)
+        fast_trend_safe = pd.Series(False, index=signal.index)
 
-    positions = pd.Series(flat_exposure, index=signal.index, name="position", dtype=float)
+    # 4. Initialize positions to flat
+    positions = pd.Series(float(flat_exposure), index=signal.index, name="position", dtype=float)
 
+    # Define Regimes
     low_regime = signal < low_thresh
     high_regime = signal > high_thresh
     moderate_regime = ~(low_regime | high_regime)
 
-    positions[low_regime] = (base_exposure[low_regime] * float(low_vol_leverage)).values
+    # --- APPLY LOGIC ROUTING ---
 
-    high_exposure = float(high_vol_bear_exposure if allow_short else flat_exposure)
+    # REGIME 1: LOW VOLATILITY
+    low_safe = low_regime & fast_trend_safe
+    low_unsafe = low_regime & ~fast_trend_safe
+    
+    # Levered long if safe. If fast trend breaks, hit the circuit breaker (go flat).
+    positions[low_safe] = (base_exposure[low_safe] * float(low_vol_leverage)).values
+    positions[low_unsafe] = float(flat_exposure)
+
+    # REGIME 2: HIGH VOLATILITY
     high_bear_mask = high_regime & ~bull_trend
     high_bull_mask = high_regime & bull_trend
+    
+    high_exposure = float(high_vol_bear_exposure if allow_short else flat_exposure)
     positions[high_bear_mask] = high_exposure
-    positions[high_bull_mask] = (
-        base_exposure[high_bull_mask] * float(low_vol_leverage)
-    ).values
+    positions[high_bull_mask] = (base_exposure[high_bull_mask] * float(low_vol_leverage)).values
 
-    positions[moderate_regime & moderate_mask] = (
-        base_exposure[moderate_regime & moderate_mask] * float(moderate_exposure)
-    ).values
-    positions[moderate_regime & ~moderate_mask] = float(flat_exposure)
+    # REGIME 3: MODERATE VOLATILITY
+    # Only take moderate exposure if both short-term momentum and fast trend are safe
+    mod_safe = moderate_regime & moderate_mask & fast_trend_safe
+    mod_unsafe = moderate_regime & ~(moderate_mask & fast_trend_safe)
+    
+    positions[mod_safe] = (base_exposure[mod_safe] * float(moderate_exposure)).values
+    positions[mod_unsafe] = float(flat_exposure)
 
     return positions
 

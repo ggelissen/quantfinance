@@ -66,7 +66,7 @@ def main(
     max_target_exposure: float = 2.0,
     # Back-test parameters
     initial_capital: float = 10_000.0,
-    transaction_cost: float = 1.0,
+    transaction_fee_pct: float = 0.0005,
     # Surface parameters
     lag_range_end: int = 31,
     surface_last_n_days: int = 252,
@@ -133,8 +133,8 @@ def main(
         Upper clip bound for target-vol base exposure. Default 2.0.
     initial_capital : float, optional
         Starting capital in dollars. Default 10 000.
-    transaction_cost : float, optional
-        Flat fee per trade in dollars. Default 1.0.
+    transaction_fee_pct : float, optional
+        Transaction fee as a percentage of trade value. Default 0.0005.
     lag_range_end : int, optional
         Upper bound (exclusive) for lag range on surface. Default 31.
     surface_last_n_days : int, optional
@@ -206,7 +206,7 @@ def main(
     # ------------------------------------------------------------------
     print("Running back-test ...")
     results = run_backtest(data, positions, initial_capital=initial_capital,
-                           transaction_cost=transaction_cost)
+                           transaction_fee_pct=transaction_fee_pct)
 
     portfolio = results["portfolio"]
     metrics = results["metrics"]
@@ -288,7 +288,7 @@ def main(
 
 if __name__ == "__main__":
     main(
-        start_date="2010-01-01",
+        start_date="2016-01-01",
         end_date="2026-01-01",
         ticker="^GSPC",
         display_name="S&P 500",
@@ -314,7 +314,7 @@ if __name__ == "__main__":
         max_target_exposure=2.0,
         # Back-test
         initial_capital=10_000.0,
-        transaction_cost=1.0,
+        transaction_fee_pct=0.0005,
         # Surface
         lag_range_end=31,
         surface_last_n_days=252,

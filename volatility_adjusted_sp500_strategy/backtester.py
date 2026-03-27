@@ -6,38 +6,17 @@ import pandas as pd
 
 def run_backtest(data: pd.DataFrame, positions: pd.Series,
                  initial_capital: float = 10_000.0,
-                 transaction_cost: float = 1.0) -> dict:
-    """Simulate daily portfolio value given a position series.
-
-    The position is applied with a one-day lag (signal computed on day t is
-    executed at the open of day t+1, i.e. we use the close-to-close return of
-    day t+1).
-
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Must contain columns ``close`` and ``returns``.
-    positions : pd.Series
-        Position multipliers (e.g. 1.2, 0.5, 0, -1).
-    initial_capital : float, optional
-        Starting capital in dollars. Default 10 000.
-    transaction_cost : float, optional
-        Flat fee per trade (both sides), in dollars. Default 1.0.
-
-    Returns
-    -------
-    dict
-        Keys: ``portfolio``, ``total_return``, ``max_drawdown``,
-        ``sharpe_ratio``, ``metrics``.
-    """
-    # Align positions to returns index and shift by 1 day
+                 transaction_fee_pct: float = 0.0005,  # 5 bps fee per trade
+                 risk_free_rate_annual: float = 0.04   # 4% annual cash yield
+                 ) -> dict:
+    """Simulate daily portfolio value given a position series."""
+    
+    # Align positions to returns index and shift by 1 day to prevent look-ahead bias
     shifted = positions.shift(1).reindex(data.index).fillna(0.0).astype(float)
-
     daily_returns = data["returns"].reindex(shifted.index).fillna(0.0).astype(float)
 
-    # Transaction costs: charged when exposure changes
-    trades = shifted.diff().abs().fillna(0.0)
-    trade_costs = trades * float(transaction_cost)
+    # Pre-calculate the daily risk-free rate (~252 trading days)
+    daily_rf = risk_free_rate_annual / 252.0
 
     # Build compounded portfolio path
     n = len(daily_returns)
@@ -48,9 +27,28 @@ def run_backtest(data: pd.DataFrame, positions: pd.Series,
     net_returns[0] = 0.0
 
     for i in range(1, n):
-        gross_multiplier = 1.0 + shifted.iloc[i] * daily_returns.iloc[i]
-        next_equity = equity[i - 1] * gross_multiplier - trade_costs.iloc[i]
+        pos_t = shifted.iloc[i]
+        pos_t_minus_1 = shifted.iloc[i - 1]
+        
+        # 1. Return on invested capital (Beta)
+        invested_return = pos_t * daily_returns.iloc[i]
+        
+        # 2. Return on Cash (Risk-Free Rate)
+        # If pos is 0.5, we have 0.5 in cash earning interest. 
+        # If pos is 1.5, we have -0.5 in cash (we pay interest to borrow).
+        cash_weight = 1.0 - pos_t
+        cash_return = cash_weight * daily_rf
+        
+        gross_multiplier = 1.0 + invested_return + cash_return
+        
+        # 3. Transaction Costs (charged on the dollar value traded)
+        weight_change = abs(pos_t - pos_t_minus_1)
+        trade_cost_dollars = weight_change * equity[i - 1] * float(transaction_fee_pct)
+        
+        # Apply multipliers and costs
+        next_equity = (equity[i - 1] * gross_multiplier) - trade_cost_dollars
         equity[i] = max(next_equity, 0.0)
+        
         prev_equity = equity[i - 1]
         net_returns[i] = (equity[i] / prev_equity - 1.0) if prev_equity > 0 else 0.0
 
