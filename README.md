@@ -1,4 +1,4 @@
-# Quantitative Finance Lab
+# Statistical Arbitrage Modelling
 
 Python research prototypes for statistical arbitrage, dependence-aware signals, volatility targeting, backtesting, and portfolio risk analysis.
 
